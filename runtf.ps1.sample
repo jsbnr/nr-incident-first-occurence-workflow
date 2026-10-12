@@ -1,0 +1,13 @@
+# A dinky helper to run terraform supplying secrets as vars
+#
+#
+$terraformNRAccountId = "XXXXXXX"        # Your New Relic account ID
+$terraformAPIKey = "NRAK-XXXXXXXXX"      # A New Relic User API Key 
+#
+#
+$Env:NEW_RELIC_ACCOUNT_ID = $terraformNRAccountId
+$Env:NEW_RELIC_API_KEY = $terraformAPIKey
+
+$planorapply = Read-Host "init | plan | apply"
+
+terraform $planorapply -var APIKey=$terraformAPIKey -var AccountId=$terraformNRAccountId
