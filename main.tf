@@ -18,14 +18,14 @@ resource "newrelic_nrql_alert_condition" "piglet_logs" {
   }
 
   critical {
-    operator              = "above_or_equals"
+    operator              = "above"
     threshold             = 5
     threshold_duration    = 900
-    threshold_occurrences = "all"
+    threshold_occurrences = "at_least_once"
   }
 
   aggregation_window           = 900
-  aggregation_method           = "EVENT_FLOW"
-  aggregation_delay            = 120
+  aggregation_method           = "EVENT_TIMER"
+  aggregation_timer            = 60
   violation_time_limit_seconds = 86400
 }
