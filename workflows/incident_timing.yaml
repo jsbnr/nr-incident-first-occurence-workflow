@@ -1,0 +1,210 @@
+name: incident_timing
+description: On issue close record when the breaching data first appeared for each incident
+
+workflowInputs:
+  # Passed automatically when triggered from an alert workflow
+  accountId:
+    type: Int
+  issueId:
+    type: String
+  # Term the alert condition matches in Log.message ("piglet" is a test value)
+  searchTerm:
+    type: String
+    defaultValue: piglet
+    required: false
+
+# Debug logs: FROM Log SELECT * WHERE workflow = 'incident_timing' (messages must not contain the search term).
+# Each NRQL string is built in a buildX step, logged before it runs (so a failing query is still visible),
+# then logged again with its results.
+steps:
+  # Also triggered on activation (required by the destination); give the close event time to land in NrAiIssue
+  - name: waitForClose
+    type: wait
+    seconds: 1
+
+  - name: buildIssueQuery
+    type: assign
+    inputs:
+      query: >-
+        SELECT latest(event) AS event, latest(incidentIds) AS incidentIds FROM NrAiIssue
+        WHERE issueId = '${{ .workflowInputs.issueId }}' AND event = 'close' SINCE 7 days ago
+
+  - name: logIssueQuery
+    type: action
+    action: newrelic.ingest.sendLogs
+    version: 1
+    inputs:
+      logs:
+        - message: "incident_timing getIssue query"
+          attributes:
+            workflow: incident_timing
+            step: getIssue
+            issueId: "${{ .workflowInputs.issueId }}"
+            query: ${{ .steps.buildIssueQuery.outputs.query }}
+
+  - name: getIssue
+    type: action
+    action: newrelic.nrdb.query
+    version: 1
+    inputs:
+      accountIds:
+        - "${{ .workflowInputs.accountId }}"
+      query: ${{ .steps.buildIssueQuery.outputs.query }}
+
+  - name: logGetIssue
+    type: action
+    action: newrelic.ingest.sendLogs
+    version: 1
+    inputs:
+      logs:
+        - message: "incident_timing getIssue"
+          attributes:
+            workflow: incident_timing
+            step: getIssue
+            issueId: "${{ .workflowInputs.issueId }}"
+            query: ${{ .steps.buildIssueQuery.outputs.query }}
+            success: ${{ .steps.getIssue.outputs.success | tostring }}
+            errorMessage: ${{ .steps.getIssue.outputs.errorMessage | tostring }}
+            results: ${{ .steps.getIssue.outputs.results | tostring }}
+
+  - name: onlyIfClosed
+    type: switch
+    switch:
+      - condition: ${{ .steps.getIssue.outputs.results[0].event | tostring | ascii_downcase | startswith("close") }}
+        next: eachIncident
+    next: end
+
+  - name: eachIncident
+    type: loop
+    for:
+      # incidentIds is a single string (comma separated or JSON array text); split into IDs
+      in: '${{ [.steps.getIssue.outputs.results[0].incidentIds | tostring | gsub("[\\[\\]\" ]"; "") | split(",")[] | select(length > 0)] }}'
+      steps:
+        - name: buildIncidentQuery
+          type: assign
+          inputs:
+            query: >-
+              SELECT latest(degradationTime) AS degradationTime, latest(openTime) AS openTime, earliest(timestamp) AS incidentOpenTime
+              FROM NrAiIncident WHERE incidentId = '${{ .steps.eachIncident.loop.element }}' AND event = 'open' SINCE 7 days ago
+
+        - name: logIncidentQuery
+          type: action
+          action: newrelic.ingest.sendLogs
+          version: 1
+          inputs:
+            logs:
+              - message: "incident_timing getIncident query"
+                attributes:
+                  workflow: incident_timing
+                  step: getIncident
+                  incidentId: "${{ .steps.eachIncident.loop.element }}"
+                  query: ${{ .steps.buildIncidentQuery.outputs.query }}
+
+        - name: getIncident
+          type: action
+          action: newrelic.nrdb.query
+          version: 1
+          inputs:
+            accountIds:
+              - "${{ .workflowInputs.accountId }}"
+            query: ${{ .steps.buildIncidentQuery.outputs.query }}
+
+        - name: logGetIncident
+          type: action
+          action: newrelic.ingest.sendLogs
+          version: 1
+          inputs:
+            logs:
+              - message: "incident_timing getIncident"
+                attributes:
+                  workflow: incident_timing
+                  step: getIncident
+                  incidentId: "${{ .steps.eachIncident.loop.element }}"
+                  query: ${{ .steps.buildIncidentQuery.outputs.query }}
+                  success: ${{ .steps.getIncident.outputs.success | tostring }}
+                  errorMessage: ${{ .steps.getIncident.outputs.errorMessage | tostring }}
+                  results: ${{ .steps.getIncident.outputs.results | tostring }}
+
+        # Epoch ms arrive as doubles and interpolate as 1.79E12, which NRQL rejects. Split into high and
+        # low parts (both print plainly), then rejoin as a plain integer string. The engine has no
+        # strftime or todate.
+        - name: buildOccurrenceQuery
+          type: assign
+          inputs:
+            query: >-
+              SELECT min(timestamp) AS firstOccurrence FROM Log
+              WHERE message LIKE '%${{ .workflowInputs.searchTerm }}%'
+              SINCE ${{ .steps.getIncident.outputs.results[0].degradationTime | (. / 1000000 | floor) as $hi | (. - $hi * 1000000) as $lo | ($hi | tostring | split(".")[0]) + (("00000" + ($lo | tostring | split(".")[0])) | .[-6:]) }}
+              UNTIL ${{ .steps.getIncident.outputs.results[0].openTime | (. / 1000000 | floor) as $hi | (. - $hi * 1000000) as $lo | ($hi | tostring | split(".")[0]) + (("00000" + ($lo | tostring | split(".")[0])) | .[-6:]) }}
+
+        - name: logOccurrenceQuery
+          type: action
+          action: newrelic.ingest.sendLogs
+          version: 1
+          inputs:
+            logs:
+              # Search term masked in the message so this log cannot match the alert condition
+              - message: 'incident_timing getFirstOccurrence query: ${{ .workflowInputs.searchTerm as $t | .steps.buildOccurrenceQuery.outputs.query | gsub($t; "<term>") }}'
+                attributes:
+                  workflow: incident_timing
+                  step: getFirstOccurrence
+                  incidentId: "${{ .steps.eachIncident.loop.element }}"
+                  query: ${{ .steps.buildOccurrenceQuery.outputs.query }}
+                  rawDegradationTime: ${{ .steps.getIncident.outputs.results[0].degradationTime | tostring }}
+                  rawOpenTime: ${{ .steps.getIncident.outputs.results[0].openTime | tostring }}
+
+        - name: getFirstOccurrence
+          type: action
+          action: newrelic.nrdb.query
+          version: 1
+          inputs:
+            accountIds:
+              - "${{ .workflowInputs.accountId }}"
+            query: ${{ .steps.buildOccurrenceQuery.outputs.query }}
+
+        - name: logGetFirstOccurrence
+          type: action
+          action: newrelic.ingest.sendLogs
+          version: 1
+          inputs:
+            logs:
+              - message: 'incident_timing getFirstOccurrence query: ${{ .workflowInputs.searchTerm as $t | .steps.buildOccurrenceQuery.outputs.query | gsub($t; "<term>") }} results: ${{ .steps.getFirstOccurrence.outputs.results | tostring }}'
+                attributes:
+                  workflow: incident_timing
+                  step: getFirstOccurrence
+                  incidentId: "${{ .steps.eachIncident.loop.element }}"
+                  query: ${{ .steps.buildOccurrenceQuery.outputs.query }}
+                  success: ${{ .steps.getFirstOccurrence.outputs.success | tostring }}
+                  errorMessage: ${{ .steps.getFirstOccurrence.outputs.errorMessage | tostring }}
+                  results: ${{ .steps.getFirstOccurrence.outputs.results | tostring }}
+
+        - name: recordTiming
+          type: action
+          action: newrelic.ingest.sendEvents
+          version: 1
+          inputs:
+            events:
+              - eventType: IncidentTiming
+                incidentId: "${{ .steps.eachIncident.loop.element }}"
+                issueId: "${{ .workflowInputs.issueId }}"
+                degradationTime: ${{ .steps.getIncident.outputs.results[0].degradationTime }}
+                openTime: ${{ .steps.getIncident.outputs.results[0].openTime }}
+                incidentOpenTime: ${{ .steps.getIncident.outputs.results[0].incidentOpenTime }}
+                firstOccurrenceTime: ${{ .steps.getFirstOccurrence.outputs.results[0].firstOccurrence }}
+                # Milliseconds from first breaching data to the incident opening; null if no matching log was found
+                timeToDetectMs: ${{ .steps.getIncident.outputs.results[0].incidentOpenTime as $open | .steps.getFirstOccurrence.outputs.results[0].firstOccurrence as $first | if $open != null and $first != null then $open - $first else null end }}
+
+        - name: logRecordTiming
+          type: action
+          action: newrelic.ingest.sendLogs
+          version: 1
+          inputs:
+            logs:
+              - message: "incident_timing recordTiming"
+                attributes:
+                  workflow: incident_timing
+                  step: recordTiming
+                  incidentId: "${{ .steps.eachIncident.loop.element }}"
+                  success: ${{ .steps.recordTiming.outputs.success | tostring }}
+                  errorMessage: ${{ .steps.recordTiming.outputs.errorMessage | tostring }}
+          next: continue
