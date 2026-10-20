@@ -2,15 +2,19 @@ name: incident_timing
 description: On issue close record when the breaching data first appeared for each incident
 
 workflowInputs:
-  # Passed automatically when triggered from an alert workflow
+  # The alert workflow did not supply accountId ("Workflow input 'accountId' is required"), so it defaults to
+  # the Terraform accountId via the placeholder. issueId is still expected from the alert workflow.
   accountId:
     type: Int
+    defaultValue: "__ACCOUNT_ID__"
+    required: false
   issueId:
     type: String
-  # Term the alert condition matches in Log.message ("piglet" is a test value)
+  # Term the alert condition matches in Log.message. The placeholder is replaced by Terraform
+  # (var.searchTerm); it is the only source of the term.
   searchTerm:
     type: String
-    defaultValue: piglet
+    defaultValue: "__SEARCH_TERM__"
     required: false
 
 # Debug logs: FROM Log SELECT * WHERE workflow = 'incident_timing' (messages must not contain the search term).
@@ -84,7 +88,8 @@ steps:
           type: assign
           inputs:
             query: >-
-              SELECT latest(degradationTime) AS degradationTime, latest(openTime) AS openTime, earliest(timestamp) AS incidentOpenTime
+              SELECT latest(degradationTime) AS degradationTime, latest(openTime) AS openTime, earliest(timestamp) AS incidentOpenTime,
+              latest(string(degradationTime, precision: 0)) AS degradationTimeStr, string(latest(degradationTime) + __AGGREGATION_WINDOW_MS__, precision: 0) AS windowEndStr
               FROM NrAiIncident WHERE incidentId = '${{ .steps.eachIncident.loop.element }}' AND event = 'open' SINCE 7 days ago
 
         - name: logIncidentQuery
@@ -125,17 +130,19 @@ steps:
                   errorMessage: ${{ .steps.getIncident.outputs.errorMessage | tostring }}
                   results: ${{ .steps.getIncident.outputs.results | tostring }}
 
-        # Epoch ms arrive as doubles and interpolate as 1.79E12, which NRQL rejects. Split into high and
-        # low parts (both print plainly), then rejoin as a plain integer string. The engine has no
-        # strftime or todate.
+        # Numeric epoch ms interpolate as 1.79E12, which NRQL rejects, so getIncident also returns them as
+        # strings (NRQL string()) and the window uses those. degradationTime is the start of the breaching
+        # aggregation window, so the search runs from degradationTime to degradationTime + aggregationWindow
+        # (__AGGREGATION_WINDOW_MS__ is replaced by Terraform from var.aggregationWindow). openTime can equal
+        # degradationTime (both land on the window boundary), which is why it is not used as the end.
         - name: buildOccurrenceQuery
           type: assign
           inputs:
             query: >-
-              SELECT min(timestamp) AS firstOccurrence FROM Log
+              SELECT earliest(timestamp) AS firstOccurrence FROM Log
               WHERE message LIKE '%${{ .workflowInputs.searchTerm }}%'
-              SINCE ${{ .steps.getIncident.outputs.results[0].degradationTime | (. / 1000000 | floor) as $hi | (. - $hi * 1000000) as $lo | ($hi | tostring | split(".")[0]) + (("00000" + ($lo | tostring | split(".")[0])) | .[-6:]) }}
-              UNTIL ${{ .steps.getIncident.outputs.results[0].openTime | (. / 1000000 | floor) as $hi | (. - $hi * 1000000) as $lo | ($hi | tostring | split(".")[0]) + (("00000" + ($lo | tostring | split(".")[0])) | .[-6:]) }}
+              SINCE ${{ .steps.getIncident.outputs.results[0].degradationTimeStr }}
+              UNTIL ${{ .steps.getIncident.outputs.results[0].windowEndStr }}
 
         - name: logOccurrenceQuery
           type: action

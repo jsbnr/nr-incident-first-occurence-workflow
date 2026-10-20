@@ -3,12 +3,26 @@ variable "userApiKey" {
   sensitive = true
 }
 
-# Runs NRQL and records the IncidentTiming event whenever a piglet issue closes.
+# Runs NRQL and records the IncidentTiming event whenever a needle issue closes.
 resource "newrelic_workflow_automation" "incident_timing" {
   name       = "incident_timing"
   scope_id   = var.accountId
   scope_type = "ACCOUNT"
-  definition = file("${path.module}/workflows/incident_timing.yaml")
+  # file() + replace() rather than templatefile(): the YAML's ${{ }} expressions clash with Terraform interpolation.
+  # jsonencode gives a quoted string that is also valid YAML.
+  definition = replace(
+    replace(
+      replace(
+        file("${path.module}/workflows/incident_timing.yaml"),
+        "\"__SEARCH_TERM__\"",
+        jsonencode(var.searchTerm)
+      ),
+      "\"__ACCOUNT_ID__\"",
+      tostring(tonumber(var.accountId))
+    ),
+    "__AGGREGATION_WINDOW_MS__",
+    tostring(var.aggregationWindow * 1000)
+  )
 }
 
 resource "newrelic_notification_destination" "workflow_automation" {
@@ -39,20 +53,28 @@ resource "newrelic_notification_channel" "incident_timing" {
     key   = "workflowAutomation"
     value = newrelic_workflow_automation.incident_timing.name
   }
+
+  # Channel properties are passed to the automation as workflow inputs, matched by name (a "payload" property
+  # was rejected as an undefined input). Values may use notification variables. accountId is not sent: it
+  # defaults to the Terraform accountId in the automation.
+  property {
+    key   = "issueId"
+    value = "{{issueId}}"
+  }
 }
 
 resource "newrelic_workflow" "incident_timing" {
-  name                  = "Piglet issue closed - incident timing"
+  name                  = "Needle issue closed - incident timing"
   muting_rules_handling = "NOTIFY_ALL_ISSUES"
 
   issues_filter {
-    name = "piglet policy"
+    name = "needle policy"
     type = "FILTER"
 
     predicate {
       attribute = "labels.policyIds"
       operator  = "EXACTLY_MATCHES"
-      values    = [newrelic_alert_policy.piglet.id]
+      values    = [newrelic_alert_policy.needle.id]
     }
   }
 
